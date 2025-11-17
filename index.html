@@ -1,0 +1,471 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Encircling Classification — Single File</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Roboto, "Segoe UI", Arial; margin: 12px; color:#111 }
+    .container { display:flex; gap:12px; align-items:flex-start }
+    .controls { width:360px; padding:12px; border:1px solid #ddd; border-radius:8px }
+    .controls h2 { margin:6px 0 12px 0; font-size:16px }
+    label { display:block; font-size:13px; margin-top:8px }
+    input[type=range] { width:100% }
+    input[type=text], input[type=number] { width:100%; box-sizing:border-box }
+    .buttons { display:flex; gap:8px; margin-top:10px }
+    button { padding:8px 10px; cursor:pointer }
+    .viz { display:flex; flex-direction:column; gap:12px }
+    canvas { background:#fff; border:1px solid #ccc; border-radius:6px }
+    .row { display:flex; gap:12px }
+    .small { font-size:12px; color:#444 }
+    .hint { font-size:12px; color:#666; margin-top:6px }
+    .control-row { display:flex; gap:8px; align-items:center }
+    .control-row > * { flex:1 }
+  </style>
+</head>
+<body>
+  <div style="display:flex; justify-content:space-between; align-items:center">
+    <h1>Encircling Classification (single-file)</h1>
+    <div class="small">Open this with Live Server to allow hot reload</div>
+  </div>
+
+  <div class="container">
+    <div class="controls">
+      <h2>Dataset / Geometry</h2>
+      <label>Ring radius: <span id="radiusVal">120</span></label>
+      <input id="radius" type="range" min="20" max="260" value="120">
+
+      <label>Ring thickness: <span id="thicknessVal">40</span></label>
+      <input id="thickness" type="range" min="2" max="200" value="40">
+
+      <label>Blue noise: <span id="blueNoiseVal">0.10</span></label>
+      <input id="blueNoise" type="range" min="0" max="0.6" step="0.01" value="0.10">
+
+      <label>Red noise: <span id="redNoiseVal">0.10</span></label>
+      <input id="redNoise" type="range" min="0" max="0.6" step="0.01" value="0.10">
+
+      <div class="hint">Blue points are inside the ring; red points encircle it. Adjust noise and radii.</div>
+
+      <h2>Training</h2>
+      <label>Learning rate: <input id="lr" type="number" step="0.0001" min="0.0001" max="1" value="0.01"></label>
+      <label>Steps / frame: <input id="stepsPerFrame" type="number" min="1" max="500" value="20"></label>
+
+      <label>Hidden layers (e.g. "16,16" or "10")</label>
+      <input id="hidden" type="text" value="16,16">
+
+      <div class="buttons">
+        <button id="resetBtn">Reset Dataset</button>
+        <button id="applyArchBtn">Apply Architecture</button>
+        <button id="startBtn">Start Training</button>
+      </div>
+
+      <div class="hint">Network updates live; line thickness shows weight magnitude.</div>
+    </div>
+
+    <div class="viz">
+      <canvas id="dataCanvas" width="600" height="600"></canvas>
+      <canvas id="netCanvas" width="600" height="220"></canvas>
+    </div>
+  </div>
+
+  <script>
+  // ---- Utilities ----
+  function randn() { // Box-Muller
+    let u=0,v=0; while(u===0) u=Math.random(); while(v===0) v=Math.random();
+    return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v);
+  }
+
+  function clamp(v,a,b){return Math.max(a,Math.min(b,v))}
+
+  // ---- Dataset ----
+  let dataset = [];
+  const N_PER_CLASS = 400;
+  let params = {
+    radius: 120,
+    thickness: 40,
+    blueNoise: 0.1,
+    redNoise: 0.1
+  };
+
+  function genDataset(){
+    dataset = [];
+    const cx = 300, cy = 300;
+    const R = Math.max(5, params.radius);
+    const T = Math.max(2, params.thickness);
+    const stdBlue = params.blueNoise * T;
+    const stdRed  = params.redNoise  * T;
+    // Blue: inner disk, uniform by area up to R - T/2
+    const innerR = Math.max(0, R - T*0.5);
+    for(let i=0;i<N_PER_CLASS;i++){
+      const angle = Math.random()*Math.PI*2;
+      const r = innerR * Math.sqrt(Math.random());
+      let x = cx + r*Math.cos(angle) + randn()*stdBlue;
+      let y = cy + r*Math.sin(angle) + randn()*stdBlue;
+      dataset.push({x:(x-cx)/200, y:(y-cy)/200, label:0});
+    }
+    // Red: ring with uniform thickness in [R - T/2, R + T/2]
+    for(let i=0;i<N_PER_CLASS;i++){
+      const angle = Math.random()*Math.PI*2;
+      const r = R + (Math.random()-0.5)*T;
+      let x = cx + r*Math.cos(angle) + randn()*stdRed;
+      let y = cy + r*Math.sin(angle) + randn()*stdRed;
+      dataset.push({x:(x-cx)/200, y:(y-cy)/200, label:1});
+    }
+  }
+
+  // ---- Neural Network ----
+  class NeuralNetwork {
+    constructor(sizes){
+      this.sizes = sizes.slice();
+      this.nLayers = sizes.length;
+      this.weights = [];
+      this.biases = [];
+      for(let i=0;i<sizes.length-1;i++){
+        // Xavier/Glorot init for tanh/sigmoid
+        let r = Math.sqrt(1 / sizes[i]);
+        let w = new Array(sizes[i+1]).fill(0).map(()=> new Array(sizes[i]).fill(0).map(()=> randn()*r*0.7));
+        // Biases explicitly set to 1 as requested
+        let b = new Array(sizes[i+1]).fill(1);
+        this.weights.push(w);
+        this.biases.push(b);
+      }
+    }
+
+    sigmoid(x){ return 1/(1+Math.exp(-x)); }
+    sigmoidPrime(x){ let s=this.sigmoid(x); return s*(1-s); }
+    tanh(x){ return Math.tanh(x); }
+    tanhPrime(x){ const t = Math.tanh(x); return 1 - t*t; }
+
+    forward(x){
+      let activations = [x.slice()];
+      let zs = [];
+      for(let l=0;l<this.weights.length;l++){
+        const w = this.weights[l], b = this.biases[l];
+        let z = new Array(w.length).fill(0);
+        for(let i=0;i<w.length;i++){
+          let s = b[i];
+          for(let j=0;j<w[i].length;j++) s += w[i][j]*activations[activations.length-1][j];
+          z[i]=s;
+        }
+        zs.push(z);
+        if(l === this.weights.length-1){
+          activations.push(z.map(v=>this.sigmoid(v)));
+        } else {
+          activations.push(z.map(v=>this.tanh(v)));
+        }
+      }
+      return {activations, zs};
+    }
+
+    predict(x){
+      return this.forward(x).activations.slice(-1)[0][0];
+    }
+
+    // Mini/full-batch gradient descent with sigmoid + cross-entropy
+    // delta_out = a - y; gradients averaged over samples
+    stepBatch(samples, lr){
+      const acc_w = this.weights.map(w => w.map(row => row.map(()=>0)));
+      const acc_b = this.biases.map(b => b.map(()=>0));
+      for(const sample of samples){
+        const x = [sample.x, sample.y];
+        const y = [sample.label];
+        const {activations, zs} = this.forward(x);
+        // gradients for this sample
+        const nabla_w = this.weights.map(w => w.map(row => row.map(()=>0)));
+        const nabla_b = this.biases.map(b => b.map(()=>0));
+        // output error (cross-entropy with sigmoid)
+        const aL = activations[activations.length-1];
+        let delta = new Array(aL.length);
+        for(let i=0;i<aL.length;i++) delta[i] = (aL[i] - y[i]);
+        nabla_b[nabla_b.length-1] = delta.slice();
+        for(let i=0;i<delta.length;i++){
+          for(let j=0;j<activations[activations.length-2].length;j++){
+            nabla_w[nabla_w.length-1][i][j] = delta[i]*activations[activations.length-2][j];
+          }
+        }
+        // backprop hidden layers (tanh hidden)
+        for(let l=2;l<this.sizes.length;l++){
+          const z = zs[zs.length-l];
+          const sp = z.map(v=> this.tanhPrime(v));
+          let newDelta = new Array(this.sizes[this.sizes.length-l]).fill(0);
+          const wNext = this.weights[this.weights.length-l+1];
+          for(let i=0;i<newDelta.length;i++){
+            let s = 0;
+            for(let k=0;k<delta.length;k++) s += wNext[k][i]*delta[k];
+            newDelta[i] = s * sp[i];
+          }
+          delta = newDelta;
+          nabla_b[nabla_b.length-l] = delta.slice();
+          for(let i=0;i<delta.length;i++){
+            for(let j=0;j<activations[activations.length-l-1].length;j++){
+              nabla_w[nabla_w.length-l][i][j] = delta[i]*activations[activations.length-l-1][j];
+            }
+          }
+        }
+        // accumulate
+        for(let l=0;l<this.weights.length;l++){
+          for(let i=0;i<this.weights[l].length;i++){
+            for(let j=0;j<this.weights[l][i].length;j++) acc_w[l][i][j] += nabla_w[l][i][j];
+            acc_b[l][i] += nabla_b[l][i];
+          }
+        }
+      }
+      const m = samples.length || 1;
+      // update with averaged gradients (plain gradient descent)
+      for(let l=0;l<this.weights.length;l++){
+        for(let i=0;i<this.weights[l].length;i++){
+          for(let j=0;j<this.weights[l][i].length;j++){
+            const g = acc_w[l][i][j] / m;
+            this.weights[l][i][j] -= lr * g;
+          }
+          const gb = acc_b[l][i] / m;
+          this.biases[l][i] -= lr * gb;
+        }
+      }
+    }
+
+    // keep single-sample API if needed
+    step(sample, lr){ this.stepBatch([sample], lr); }
+  }
+
+  // ---- App State ----
+  let nn = null;
+  let training = false;
+
+  // ---- UI bindings ----
+  const radiusEl = document.getElementById('radius');
+  const thicknessEl = document.getElementById('thickness');
+  const redNoiseEl = document.getElementById('redNoise');
+  const blueNoiseEl = document.getElementById('blueNoise');
+  const lrEl = document.getElementById('lr');
+  const stepsEl = document.getElementById('stepsPerFrame');
+  const hiddenEl = document.getElementById('hidden');
+  const resetBtn = document.getElementById('resetBtn');
+  const applyArchBtn = document.getElementById('applyArchBtn');
+  const startBtn = document.getElementById('startBtn');
+
+  const radiusVal = document.getElementById('radiusVal');
+  const thicknessVal = document.getElementById('thicknessVal');
+  const redNoiseVal = document.getElementById('redNoiseVal');
+  const blueNoiseVal = document.getElementById('blueNoiseVal');
+
+  function readParams(){
+    params.radius = Number(radiusEl.value);
+    params.thickness = Number(thicknessEl.value);
+    params.redNoise = Number(redNoiseEl.value);
+    params.blueNoise = Number(blueNoiseEl.value);
+    radiusVal.textContent = params.radius;
+    thicknessVal.textContent = params.thickness;
+    redNoiseVal.textContent = params.redNoise.toFixed(2);
+    blueNoiseVal.textContent = params.blueNoise.toFixed(2);
+  }
+
+  radiusEl.addEventListener('input', ()=>{ readParams(); genDataset(); draw(); });
+  thicknessEl.addEventListener('input', ()=>{ readParams(); genDataset(); draw(); });
+  redNoiseEl.addEventListener('input', ()=>{ readParams(); genDataset(); draw(); });
+  blueNoiseEl.addEventListener('input', ()=>{ readParams(); genDataset(); draw(); });
+
+  resetBtn.addEventListener('click', ()=>{ genDataset(); draw(); });
+
+  applyArchBtn.addEventListener('click', ()=>{
+    let hidden = parseHidden(hiddenEl.value);
+    const sizes = [2].concat(hidden).concat([1]);
+    nn = new NeuralNetwork(sizes);
+    draw();
+  });
+
+  startBtn.addEventListener('click', ()=>{
+    training = !training;
+    startBtn.textContent = training ? 'Pause Training' : 'Start Training';
+  });
+
+  function parseHidden(str){
+    if(!str) return [8,6];
+    return str.split(',').map(s=>parseInt(s.trim())).filter(n=>!isNaN(n) && n>0);
+  }
+
+  // ---- Drawing ----
+  const dc = document.getElementById('dataCanvas');
+  const dctx = dc.getContext('2d');
+  const nc = document.getElementById('netCanvas');
+  const nctx = nc.getContext('2d');
+
+  function draw(){
+    // background grid / decision map
+    const w = dc.width, h = dc.height;
+    const img = dctx.createImageData(w,h);
+    if(nn){
+      // sample every 6 pixels
+      for(let y=0;y<h;y+=6){
+        for(let x=0;x<w;x+=6){
+          const vx = (x - w/2)/200; const vy = (y - h/2)/200;
+          const p = nn.predict([vx,vy]);
+          const idx = (y*w + x)*4;
+          // blend red/blue
+          let r = Math.floor(255 * p); let b = Math.floor(255 * (1-p));
+          for(let yy=0; yy<6 && y+yy<h; yy++){
+            for(let xx=0; xx<6 && x+xx<w; xx++){
+              let id = ((y+yy)*w + (x+xx))*4;
+              img.data[id+0] = r; img.data[id+1]=Math.floor(200*(1-p)+55*p); img.data[id+2] = b; img.data[id+3]=50;
+            }
+          }
+        }
+      }
+      dctx.putImageData(img,0,0);
+    } else {
+      dctx.fillStyle = '#ffffff'; dctx.fillRect(0,0,w,h);
+    }
+
+    // draw points
+    dctx.clearRect(0,0,0,0);
+    // keep underlying decision area by re-putting image or clear background
+    if(nn){ dctx.putImageData(img,0,0);} else { dctx.fillStyle='#fff'; dctx.fillRect(0,0,w,h); }
+    for(const p of dataset){
+      const x = p.x*200 + w/2; const y = p.y*200 + h/2;
+      dctx.beginPath();
+      dctx.arc(x,y,3,0,Math.PI*2);
+      dctx.fillStyle = p.label===1 ? 'rgba(200,30,30,0.9)' : 'rgba(40,100,220,0.9)';
+      dctx.fill();
+    }
+
+    // overlay decision boundary (p=0.5) as a moving line
+    if(nn){ drawDecisionBoundary(6); }
+
+    drawNetwork();
+  }
+
+  function drawDecisionBoundary(step){
+    const w = dc.width, h = dc.height;
+    const field = (x,y)=> nn.predict([(x - w/2)/200, (y - h/2)/200]) - 0.5;
+    const interp = (x1,y1,x2,y2,v1,v2)=>{
+      const t = v1/(v1 - v2);
+      return {x: x1 + t*(x2-x1), y: y1 + t*(y2-y1)};
+    };
+    // edge index mapping helpers
+    function edgePoint(edge, x,y,s, f00,f10,f11,f01){
+      switch(edge){
+        case 0: return interp(x, y, x+s, y,     f00, f10); // bottom
+        case 1: return interp(x+s, y, x+s, y+s, f10, f11); // right
+        case 2: return interp(x+s, y+s, x, y+s, f11, f01); // top
+        case 3: return interp(x, y+s, x, y,     f01, f00); // left
+      }
+    }
+    const cases = {
+      0: [], 1: [[3,0]], 2: [[0,1]], 3: [[3,1]],
+      4: [[1,2]], 5: [[3,2],[0,1]], 6: [[0,2]], 7: [[3,2]],
+      8: [[2,3]], 9: [[0,2]], 10: [[1,3],[0,2]], 11: [[1,2]],
+      12: [[1,3]], 13: [[0,1]], 14: [[3,0]], 15: []
+    };
+    dctx.save();
+    dctx.lineWidth = 2;
+    dctx.strokeStyle = 'rgba(0,0,0,0.9)';
+    for(let y=0;y<h-step;y+=step){
+      for(let x=0;x<w-step;x+=step){
+        const f00 = field(x,y);
+        const f10 = field(x+step,y);
+        const f11 = field(x+step,y+step);
+        const f01 = field(x,y+step);
+        let idx = 0;
+        if(f00>0) idx |= 1;
+        if(f10>0) idx |= 2;
+        if(f11>0) idx |= 4;
+        if(f01>0) idx |= 8;
+        const conns = cases[idx];
+        if(conns && conns.length){
+          for(const [eA,eB] of conns){
+            const A = edgePoint(eA, x,y,step, f00,f10,f11,f01);
+            const B = edgePoint(eB, x,y,step, f00,f10,f11,f01);
+            if(!A || !B) continue;
+            dctx.beginPath(); dctx.moveTo(A.x,A.y); dctx.lineTo(B.x,B.y); dctx.stroke();
+          }
+        }
+      }
+    }
+    dctx.restore();
+  }
+
+  function drawNetwork(){
+    const ctx = nctx; ctx.clearRect(0,0,nc.width,nc.height);
+    ctx.fillStyle = '#fff'; ctx.fillRect(0,0,nc.width,nc.height);
+    if(!nn) return;
+    const layers = nn.sizes;
+    const cols = layers.length;
+    const marginX = 40, marginY = 20;
+    const colW = (nc.width - marginX*2) / (cols-1);
+    // compute node positions
+    const positions = [];
+    for(let i=0;i<cols;i++){
+      const nodes = layers[i];
+      const x = marginX + i*colW;
+      const colPos = [];
+      for(let j=0;j<nodes;j++){
+        const y = marginY + (nc.height- marginY*2) * (j/(nodes-1 || 1));
+        colPos.push({x,y});
+      }
+      positions.push(colPos);
+    }
+    // draw connections
+    let maxW = 0;
+    for(let l=0;l<nn.weights.length;l++){
+      for(let i=0;i<nn.weights[l].length;i++){
+        for(let j=0;j<nn.weights[l][i].length;j++){
+          maxW = Math.max(maxW, Math.abs(nn.weights[l][i][j]));
+        }
+      }
+    }
+    const widthScale = maxW>0 ? 6/maxW : 1;
+    for(let l=0;l<nn.weights.length;l++){
+      for(let i=0;i<nn.weights[l].length;i++){
+        for(let j=0;j<nn.weights[l][i].length;j++){
+          const wv = nn.weights[l][i][j];
+          const a = positions[l][j];
+          const b = positions[l+1][i];
+          ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y);
+          const mag = Math.abs(wv);
+          ctx.lineWidth = Math.min(12, Math.max(0.5, mag*widthScale));
+          if(wv>0) ctx.strokeStyle = `rgba(200,30,30,${clamp(mag/(maxW||1),0.08,0.95)})`;
+          else ctx.strokeStyle = `rgba(30,80,200,${clamp(mag/(maxW||1),0.08,0.95)})`;
+          ctx.stroke();
+        }
+      }
+    }
+    // draw nodes
+    for(let i=0;i<positions.length;i++){
+      for(let j=0;j<positions[i].length;j++){
+        const pos = positions[i][j];
+        // compute activation for visual (feed zero input for consistent look) or derive approximate
+        let act = 0.5;
+        // draw circle
+        ctx.beginPath(); ctx.arc(pos.x,pos.y,10,0,Math.PI*2);
+        ctx.fillStyle = `rgba(${Math.floor(200*act)},${Math.floor(60*(1-act)+60)},${Math.floor(240*(1-act))},0.95)`;
+        ctx.fill();
+        ctx.strokeStyle='#333'; ctx.lineWidth=1; ctx.stroke();
+      }
+    }
+  }
+
+  // ---- Training loop ----
+  function trainStep(){
+    if(!nn) return;
+    const lr = Number(lrEl.value);
+    const steps = Math.max(1, parseInt(stepsEl.value));
+    for(let i=0;i<steps;i++){
+      nn.stepBatch(dataset, lr); // full-batch gradient descent per step
+    }
+  }
+
+  function frame(){
+    if(training && nn){ trainStep(); }
+    draw();
+    requestAnimationFrame(frame);
+  }
+
+  // ---- Init ----
+  readParams();
+  genDataset();
+  nn = new NeuralNetwork([2,16,16,1]);
+  draw();
+  requestAnimationFrame(frame);
+  </script>
+</body>
+</html>
